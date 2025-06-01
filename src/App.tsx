@@ -1,6 +1,7 @@
 import React from 'react';
 import { Routes, Route } from 'react-router-dom';
 import { useAuthStore } from './store/authStore';
+import { useSocialStore } from './store/socialStore';
 
 // Layouts
 import MainLayout from './layouts/MainLayout';
@@ -29,6 +30,12 @@ import AdminRoute from './components/auth/AdminRoute';
 
 function App() {
   const { initialized } = useAuthStore();
+  const initializeScheduler = useSocialStore(state => state.initializeScheduler);
+
+  // Initialize scheduler when app starts
+  React.useEffect(() => {
+    initializeScheduler();
+  }, [initializeScheduler]);
 
   if (!initialized) {
     return (
