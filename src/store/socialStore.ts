@@ -53,6 +53,7 @@ interface SocialState {
   schedulePost: (post: Omit<ScheduledPost, 'id' | 'status'>) => Promise<void>;
   publishNow: (platform: SocialPlatform, content: { text: string; video?: File }) => Promise<void>;
   fetchStats: (platform: SocialPlatform) => Promise<void>;
+  checkScheduledPosts: () => Promise<void>;
 }
 
 const VALID_PLATFORMS: SocialPlatform[] = ['telegram', 'instagram', 'tiktok'];
@@ -63,375 +64,439 @@ const isValidPlatform = (platform: any): platform is SocialPlatform => {
 
 export const useSocialStore = create<SocialState>()(
   persist(
-    (set, get) => ({
-      accounts: [],
-      scheduledPosts: [],
-      loading: false,
-      error: null,
+    (set, get) => {
+      // Start checking scheduled posts when store is created
+      setInterval(() => {
+        get().checkScheduledPosts();
+      }, 60000); // Check every minute
 
-      connectAccount: async (platform, code, channelUsername) => {
-        try {
-          if (!isValidPlatform(platform)) {
-            throw new Error('Invalid platform');
-          }
+      return {
+        accounts: [],
+        scheduledPosts: [],
+        loading: false,
+        error: null,
 
-          set({ loading: true });
-          
-          let stats: SocialStats;
-          let metadata = {};
-          let platformUserId = '';
+        checkScheduledPosts: async () => {
+          try {
+            const { data: userData } = await supabase.auth.getUser();
+            if (!userData.user) return;
 
-          switch (platform) {
-            case 'telegram':
+            const now = new Date();
+            const { data: posts } = await supabase
+              .from('scheduled_posts')
+              .select('*')
+              .eq('user_id', userData.user.id)
+              .eq('status', 'pending')
+              .lte('scheduled_for', now.toISOString());
+
+            if (!posts) return;
+
+            for (const post of posts) {
               try {
-                if (!channelUsername) {
-                  throw new Error('Channel username is required for Telegram');
-                }
+                const account = get().accounts.find(acc => acc.platform === post.platform);
+                if (!account) continue;
 
-                const botResponse = await fetch(`https://api.telegram.org/bot${code}/getMe`);
-                const botData = await botResponse.json();
-                
-                if (!botData.ok) {
-                  throw new Error('Invalid Telegram bot token');
-                }
+                // Attempt to publish the post
+                await get().publishNow(post.platform, post.content);
 
-                const cleanChannelUsername = channelUsername.startsWith('@') 
-                  ? channelUsername 
-                  : '@' + channelUsername;
+                // Update post status to published
+                await supabase
+                  .from('scheduled_posts')
+                  .update({ status: 'published' })
+                  .eq('id', post.id);
 
-                const chatStatsResponse = await fetch(`https://api.telegram.org/bot${code}/getChatMembersCount?chat_id=${cleanChannelUsername}`);
-                const chatStatsData = await chatStatsResponse.json();
-                
-                platformUserId = botData.result.id.toString();
-                metadata = { 
-                  username: botData.result.username,
-                  firstName: botData.result.first_name,
-                  chatId: cleanChannelUsername
-                };
-                
-                stats = {
-                  followers: chatStatsData.ok ? chatStatsData.result : 0,
-                  views: 0,
-                  engagement: 0,
-                  posts: 0
-                };
+                set(state => ({
+                  scheduledPosts: state.scheduledPosts.map(p =>
+                    p.id === post.id ? { ...p, status: 'published' } : p
+                  )
+                }));
               } catch (error) {
-                console.error('Telegram API error:', error);
-                throw new Error('Failed to connect Telegram');
-              }
-              break;
-
-            case 'instagram':
-              throw new Error('Нужен бизнес-аккаунт');
-
-            case 'tiktok':
-              try {
-                const tiktokResponse = await fetch(`https://open.tiktokapis.com/v2/user/info/?access_token=${code}`);
-                const tiktokData = await tiktokResponse.json();
+                console.error(`Failed to publish scheduled post ${post.id}:`, error);
                 
-                platformUserId = tiktokData.open_id || `tiktok-${Date.now()}`;
-                metadata = {
-                  username: tiktokData.username || 'tiktok_user',
-                  followersCount: tiktokData.follower_count,
-                  videoCount: tiktokData.video_count
-                };
-                
-                stats = {
-                  followers: tiktokData.follower_count || 0,
-                  views: 0,
-                  engagement: 0,
-                  posts: tiktokData.video_count || 0
-                };
-              } catch (error) {
-                console.error('TikTok API error:', error);
-                throw new Error('Failed to connect TikTok');
+                await supabase
+                  .from('scheduled_posts')
+                  .update({ 
+                    status: 'failed',
+                    error: error.message 
+                  })
+                  .eq('id', post.id);
+
+                set(state => ({
+                  scheduledPosts: state.scheduledPosts.map(p =>
+                    p.id === post.id ? { ...p, status: 'failed', error: error.message } : p
+                  )
+                }));
               }
-              break;
-
-            default:
-              throw new Error('Unsupported platform');
+            }
+          } catch (error) {
+            console.error('Error checking scheduled posts:', error);
           }
+        },
 
-          const existingAccounts = get().accounts.filter(acc => acc.platform !== platform);
+        connectAccount: async (platform, code, channelUsername) => {
+          try {
+            if (!isValidPlatform(platform)) {
+              throw new Error('Invalid platform');
+            }
 
-          const newAccount: SocialAccount = {
-            id: Math.random().toString(36).substring(2),
-            platform,
-            platformUserId,
-            name: `${platform} Account`,
-            accessToken: code,
-            metadata,
-            stats
-          };
+            set({ loading: true });
+            
+            let stats: SocialStats;
+            let metadata = {};
+            let platformUserId = '';
 
-          // Save account to Supabase
-          const { data: userData } = await supabase.auth.getUser();
-          if (!userData.user) {
-            throw new Error('User not authenticated');
-          }
+            switch (platform) {
+              case 'telegram':
+                try {
+                  if (!channelUsername) {
+                    throw new Error('Channel username is required for Telegram');
+                  }
 
-          const { error: saveError } = await supabase
-            .from('social_accounts')
-            .upsert({
-              user_id: userData.user.id,
+                  const botResponse = await fetch(`https://api.telegram.org/bot${code}/getMe`);
+                  const botData = await botResponse.json();
+                  
+                  if (!botData.ok) {
+                    throw new Error('Invalid Telegram bot token');
+                  }
+
+                  const cleanChannelUsername = channelUsername.startsWith('@') 
+                    ? channelUsername 
+                    : '@' + channelUsername;
+
+                  const chatStatsResponse = await fetch(`https://api.telegram.org/bot${code}/getChatMembersCount?chat_id=${cleanChannelUsername}`);
+                  const chatStatsData = await chatStatsResponse.json();
+                  
+                  platformUserId = botData.result.id.toString();
+                  metadata = { 
+                    username: botData.result.username,
+                    firstName: botData.result.first_name,
+                    chatId: cleanChannelUsername
+                  };
+                  
+                  stats = {
+                    followers: chatStatsData.ok ? chatStatsData.result : 0,
+                    views: 0,
+                    engagement: 0,
+                    posts: 0
+                  };
+                } catch (error) {
+                  console.error('Telegram API error:', error);
+                  throw new Error('Failed to connect Telegram');
+                }
+                break;
+
+              case 'instagram':
+                throw new Error('Нужен бизнес-аккаунт');
+
+              case 'tiktok':
+                try {
+                  const tiktokResponse = await fetch(`https://open.tiktokapis.com/v2/user/info/?access_token=${code}`);
+                  const tiktokData = await tiktokResponse.json();
+                  
+                  platformUserId = tiktokData.open_id || `tiktok-${Date.now()}`;
+                  metadata = {
+                    username: tiktokData.username || 'tiktok_user',
+                    followersCount: tiktokData.follower_count,
+                    videoCount: tiktokData.video_count
+                  };
+                  
+                  stats = {
+                    followers: tiktokData.follower_count || 0,
+                    views: 0,
+                    engagement: 0,
+                    posts: tiktokData.video_count || 0
+                  };
+                } catch (error) {
+                  console.error('TikTok API error:', error);
+                  throw new Error('Failed to connect TikTok');
+                }
+                break;
+
+              default:
+                throw new Error('Unsupported platform');
+            }
+
+            const existingAccounts = get().accounts.filter(acc => acc.platform !== platform);
+
+            const newAccount: SocialAccount = {
+              id: Math.random().toString(36).substring(2),
               platform,
-              platform_user_id: platformUserId,
-              access_token: code,
-              metadata
-            });
+              platformUserId,
+              name: `${platform} Account`,
+              accessToken: code,
+              metadata,
+              stats
+            };
 
-          if (saveError) {
-            throw saveError;
+            // Save account to Supabase
+            const { data: userData } = await supabase.auth.getUser();
+            if (!userData.user) {
+              throw new Error('User not authenticated');
+            }
+
+            const { error: saveError } = await supabase
+              .from('social_accounts')
+              .upsert({
+                user_id: userData.user.id,
+                platform,
+                platform_user_id: platformUserId,
+                access_token: code,
+                metadata
+              });
+
+            if (saveError) {
+              throw saveError;
+            }
+
+            set(state => ({
+              accounts: [...existingAccounts, newAccount],
+              loading: false
+            }));
+
+            toast.success(`${platform} успешно подключен!`);
+          } catch (error) {
+            console.error('Error connecting account:', error);
+            set({ error: error.message, loading: false });
+            throw error;
           }
+        },
 
-          set(state => ({
-            accounts: [...existingAccounts, newAccount],
-            loading: false
-          }));
+        disconnectAccount: async (platform) => {
+          try {
+            if (!isValidPlatform(platform)) {
+              throw new Error('Invalid platform');
+            }
 
-          toast.success(`${platform} успешно подключен!`);
-        } catch (error) {
-          console.error('Error connecting account:', error);
-          set({ error: error.message, loading: false });
-          throw error;
-        }
-      },
+            const { data: userData } = await supabase.auth.getUser();
+            if (!userData.user) {
+              throw new Error('User not authenticated');
+            }
 
-      disconnectAccount: async (platform) => {
-        try {
+            // Delete account from Supabase
+            const { error: deleteError } = await supabase
+              .from('social_accounts')
+              .delete()
+              .eq('platform', platform)
+              .eq('user_id', userData.user.id);
+
+            if (deleteError) {
+              throw deleteError;
+            }
+
+            // Delete scheduled posts for this platform
+            const { error: deletePostsError } = await supabase
+              .from('scheduled_posts')
+              .delete()
+              .eq('platform', platform)
+              .eq('user_id', userData.user.id);
+
+            if (deletePostsError) {
+              throw deletePostsError;
+            }
+
+            set(state => ({
+              accounts: state.accounts.filter(acc => acc.platform !== platform),
+              scheduledPosts: state.scheduledPosts.filter(post => post.platform !== platform),
+              loading: false
+            }));
+
+            toast.success(`${platform} отключен`);
+          } catch (error) {
+            console.error('Error disconnecting account:', error);
+            set({ error: error.message, loading: false });
+            throw error;
+          }
+        },
+
+        getAccount: (platform) => {
           if (!isValidPlatform(platform)) {
-            throw new Error('Invalid platform');
+            return undefined;
           }
+          return get().accounts.find(acc => acc.platform === platform);
+        },
 
-          const { data: userData } = await supabase.auth.getUser();
-          if (!userData.user) {
-            throw new Error('User not authenticated');
-          }
+        schedulePost: async (post) => {
+          try {
+            if (!isValidPlatform(post.platform)) {
+              throw new Error('Invalid platform');
+            }
 
-          // Delete account from Supabase
-          const { error: deleteError } = await supabase
-            .from('social_accounts')
-            .delete()
-            .eq('platform', platform)
-            .eq('user_id', userData.user.id);
+            set({ loading: true });
 
-          if (deleteError) {
-            throw deleteError;
-          }
+            const { data: userData } = await supabase.auth.getUser();
+            if (!userData.user) {
+              throw new Error('User not authenticated');
+            }
 
-          // Delete scheduled posts for this platform
-          const { error: deletePostsError } = await supabase
-            .from('scheduled_posts')
-            .delete()
-            .eq('platform', platform)
-            .eq('user_id', userData.user.id);
-
-          if (deletePostsError) {
-            throw deletePostsError;
-          }
-
-          set(state => ({
-            accounts: state.accounts.filter(acc => acc.platform !== platform),
-            scheduledPosts: state.scheduledPosts.filter(post => post.platform !== platform),
-            loading: false
-          }));
-
-          toast.success(`${platform} отключен`);
-        } catch (error) {
-          console.error('Error disconnecting account:', error);
-          set({ error: error.message, loading: false });
-          throw error;
-        }
-      },
-
-      getAccount: (platform) => {
-        if (!isValidPlatform(platform)) {
-          return undefined;
-        }
-        return get().accounts.find(acc => acc.platform === platform);
-      },
-
-      schedulePost: async (post) => {
-        try {
-          if (!isValidPlatform(post.platform)) {
-            throw new Error('Invalid platform');
-          }
-
-          set({ loading: true });
-
-          const { data: userData } = await supabase.auth.getUser();
-          if (!userData.user) {
-            throw new Error('User not authenticated');
-          }
-
-          const newPost: ScheduledPost = {
-            ...post,
-            id: Math.random().toString(36).substring(2),
-            status: 'pending'
-          };
-
-          // Save post to Supabase
-          const { error: saveError } = await supabase
-            .from('scheduled_posts')
-            .insert({
-              user_id: userData.user.id,
-              platform: post.platform,
-              content: post.content,
-              scheduled_for: post.scheduledFor,
+            const newPost: ScheduledPost = {
+              ...post,
+              id: Math.random().toString(36).substring(2),
               status: 'pending'
-            });
+            };
 
-          if (saveError) {
-            throw saveError;
+            // Save post to Supabase
+            const { error: saveError } = await supabase
+              .from('scheduled_posts')
+              .insert({
+                user_id: userData.user.id,
+                platform: post.platform,
+                content: post.content,
+                scheduled_for: post.scheduledFor,
+                status: 'pending'
+              });
+
+            if (saveError) {
+              throw saveError;
+            }
+
+            set(state => ({
+              scheduledPosts: [...state.scheduledPosts, newPost],
+              loading: false
+            }));
+
+            toast.success('Пост успешно запланирован');
+          } catch (error) {
+            console.error('Error scheduling post:', error);
+            set({ error: error.message, loading: false });
+            throw error;
           }
+        },
 
-          set(state => ({
-            scheduledPosts: [...state.scheduledPosts, newPost],
-            loading: false
-          }));
+        publishNow: async (platform, content) => {
+          try {
+            if (!isValidPlatform(platform)) {
+              throw new Error('Invalid platform');
+            }
 
-          toast.success('Пост успешно запланирован');
-        } catch (error) {
-          console.error('Error scheduling post:', error);
-          set({ error: error.message, loading: false });
-          throw error;
-        }
-      },
+            set({ loading: true });
+            
+            const account = get().accounts.find(acc => acc.platform === platform);
+            if (!account) {
+              throw new Error(`${platform} не подключен`);
+            }
 
-      publishNow: async (platform, content) => {
-        try {
-          if (!isValidPlatform(platform)) {
-            throw new Error('Invalid platform');
-          }
-
-          set({ loading: true });
-          
-          const account = get().accounts.find(acc => acc.platform === platform);
-          if (!account) {
-            throw new Error(`${platform} не подключен`);
-          }
-
-          switch (platform) {
-            case 'telegram':
-              try {
-                const formData = new FormData();
-                formData.append('chat_id', account.metadata.chatId);
-                formData.append('video', content.video!);
-                formData.append('caption', content.text);
-                
-                const response = await fetch(`https://api.telegram.org/bot${account.accessToken}/sendVideo`, {
-                  method: 'POST',
-                  body: formData
-                });
-                
-                if (!response.ok) {
+            switch (platform) {
+              case 'telegram':
+                try {
+                  const formData = new FormData();
+                  formData.append('chat_id', account.metadata.chatId);
+                  formData.append('video', content.video!);
+                  formData.append('caption', content.text);
+                  
+                  const response = await fetch(`https://api.telegram.org/bot${account.accessToken}/sendVideo`, {
+                    method: 'POST',
+                    body: formData
+                  });
+                  
+                  if (!response.ok) {
+                    throw new Error('Failed to publish to Telegram');
+                  }
+                } catch (error) {
+                  console.error('Telegram API error:', error);
                   throw new Error('Failed to publish to Telegram');
                 }
-              } catch (error) {
-                console.error('Telegram API error:', error);
-                throw new Error('Failed to publish to Telegram');
-              }
-              break;
+                break;
 
-            case 'instagram':
-              await new Promise(resolve => setTimeout(resolve, 1000));
-              break;
+              case 'instagram':
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                break;
 
-            case 'tiktok':
-              await new Promise(resolve => setTimeout(resolve, 1000));
-              break;
+              case 'tiktok':
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                break;
+            }
+
+            set({ loading: false });
+            toast.success(`Видео опубликовано в ${platform}`);
+          } catch (error) {
+            console.error('Error publishing:', error);
+            set({ error: error.message, loading: false });
+            throw error;
           }
+        },
 
-          set({ loading: false });
-          toast.success(`Видео опубликовано в ${platform}`);
-        } catch (error) {
-          console.error('Error publishing:', error);
-          set({ error: error.message, loading: false });
-          throw error;
+        fetchStats: async (platform) => {
+          try {
+            if (!isValidPlatform(platform)) {
+              throw new Error('Invalid platform');
+            }
+
+            set({ loading: true });
+            
+            const account = get().accounts.find(acc => acc.platform === platform);
+            if (!account) {
+              throw new Error(`${platform} не подключен`);
+            }
+
+            let newStats: SocialStats = { ...account.stats };
+
+            switch (platform) {
+              case 'telegram':
+                try {
+                  const chatStatsResponse = await fetch(`https://api.telegram.org/bot${account.accessToken}/getChatMembersCount?chat_id=${account.metadata.chatId}`);
+                  const chatStatsData = await chatStatsResponse.json();
+                  
+                  if (chatStatsData.ok) {
+                    newStats = {
+                      ...newStats,
+                      followers: chatStatsData.result
+                    };
+                  }
+                } catch (error) {
+                  console.error('Telegram API error:', error);
+                }
+                break;
+
+              case 'instagram':
+                try {
+                  const userResponse = await fetch(`https://graph.instagram.com/me?fields=media_count,followers_count&access_token=${account.accessToken}`);
+                  const userData = await userResponse.json();
+                  
+                  if (userData.id) {
+                    newStats = {
+                      ...newStats,
+                      followers: userData.followers_count || newStats.followers,
+                      posts: userData.media_count || newStats.posts
+                    };
+                  }
+                } catch (error) {
+                  console.error('Instagram API error:', error);
+                }
+                break;
+
+              case 'tiktok':
+                try {
+                  const tiktokResponse = await fetch(`https://open.tiktokapis.com/v2/user/info/?access_token=${account.accessToken}`);
+                  const tiktokData = await tiktokResponse.json();
+                  
+                  if (tiktokData.open_id) {
+                    newStats = {
+                      ...newStats,
+                      followers: tiktokData.follower_count || newStats.followers,
+                      posts: tiktokData.video_count || newStats.posts
+                    };
+                  }
+                } catch (error) {
+                  console.error('TikTok API error:', error);
+                }
+                break;
+            }
+
+            set(state => ({
+              accounts: state.accounts.map(acc =>
+                acc.id === account.id ? { ...acc, stats: newStats } : acc
+              )
+            }));
+
+            set({ loading: false });
+          } catch (error) {
+            console.error('Error fetching stats:', error);
+            set({ error: error.message, loading: false });
+            throw error;
+          }
         }
-      },
-
-      fetchStats: async (platform) => {
-        try {
-          if (!isValidPlatform(platform)) {
-            throw new Error('Invalid platform');
-          }
-
-          set({ loading: true });
-          
-          const account = get().accounts.find(acc => acc.platform === platform);
-          if (!account) {
-            throw new Error(`${platform} не подключен`);
-          }
-
-          let newStats: SocialStats = { ...account.stats };
-
-          switch (platform) {
-            case 'telegram':
-              try {
-                const chatStatsResponse = await fetch(`https://api.telegram.org/bot${account.accessToken}/getChatMembersCount?chat_id=${account.metadata.chatId}`);
-                const chatStatsData = await chatStatsResponse.json();
-                
-                if (chatStatsData.ok) {
-                  newStats = {
-                    ...newStats,
-                    followers: chatStatsData.result
-                  };
-                }
-              } catch (error) {
-                console.error('Telegram API error:', error);
-              }
-              break;
-
-            case 'instagram':
-              try {
-                const userResponse = await fetch(`https://graph.instagram.com/me?fields=media_count,followers_count&access_token=${account.accessToken}`);
-                const userData = await userResponse.json();
-                
-                if (userData.id) {
-                  newStats = {
-                    ...newStats,
-                    followers: userData.followers_count || newStats.followers,
-                    posts: userData.media_count || newStats.posts
-                  };
-                }
-              } catch (error) {
-                console.error('Instagram API error:', error);
-              }
-              break;
-
-            case 'tiktok':
-              try {
-                const tiktokResponse = await fetch(`https://open.tiktokapis.com/v2/user/info/?access_token=${account.accessToken}`);
-                const tiktokData = await tiktokResponse.json();
-                
-                if (tiktokData.open_id) {
-                  newStats = {
-                    ...newStats,
-                    followers: tiktokData.follower_count || newStats.followers,
-                    posts: tiktokData.video_count || newStats.posts
-                  };
-                }
-              } catch (error) {
-                console.error('TikTok API error:', error);
-              }
-              break;
-          }
-
-          set(state => ({
-            accounts: state.accounts.map(acc =>
-              acc.id === account.id ? { ...acc, stats: newStats } : acc
-            )
-          }));
-
-          set({ loading: false });
-        } catch (error) {
-          console.error('Error fetching stats:', error);
-          set({ error: error.message, loading: false });
-          throw error;
-        }
-      }
-    }),
+      };
+    },
     {
       name: 'social-storage',
       onRehydrateStorage: () => (state) => {
