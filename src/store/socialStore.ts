@@ -126,7 +126,7 @@ export const useSocialStore = create<SocialState>()(
 
             case 'tiktok':
               try {
-                const tiktokResponse = await fetch(`https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,following_count,follower_count,likes_count,video_count&access_token=${code}`);
+                const tiktokResponse = await fetch(`https://open.tiktokapis.com/v2/user/info/?access_token=${code}`);
                 const tiktokData = await tiktokResponse.json();
                 
                 platformUserId = tiktokData.open_id || `tiktok-${Date.now()}`;
@@ -165,9 +165,15 @@ export const useSocialStore = create<SocialState>()(
           };
 
           // Save account to Supabase
+          const { data: userData } = await supabase.auth.getUser();
+          if (!userData.user) {
+            throw new Error('User not authenticated');
+          }
+
           const { error: saveError } = await supabase
             .from('social_accounts')
             .upsert({
+              user_id: userData.user.id,
               platform,
               platform_user_id: platformUserId,
               access_token: code,
@@ -197,11 +203,17 @@ export const useSocialStore = create<SocialState>()(
             throw new Error('Invalid platform');
           }
 
+          const { data: userData } = await supabase.auth.getUser();
+          if (!userData.user) {
+            throw new Error('User not authenticated');
+          }
+
           // Delete account from Supabase
           const { error: deleteError } = await supabase
             .from('social_accounts')
             .delete()
-            .eq('platform', platform);
+            .eq('platform', platform)
+            .eq('user_id', userData.user.id);
 
           if (deleteError) {
             throw deleteError;
@@ -211,7 +223,8 @@ export const useSocialStore = create<SocialState>()(
           const { error: deletePostsError } = await supabase
             .from('scheduled_posts')
             .delete()
-            .eq('platform', platform);
+            .eq('platform', platform)
+            .eq('user_id', userData.user.id);
 
           if (deletePostsError) {
             throw deletePostsError;
@@ -246,6 +259,11 @@ export const useSocialStore = create<SocialState>()(
 
           set({ loading: true });
 
+          const { data: userData } = await supabase.auth.getUser();
+          if (!userData.user) {
+            throw new Error('User not authenticated');
+          }
+
           const newPost: ScheduledPost = {
             ...post,
             id: Math.random().toString(36).substring(2),
@@ -256,6 +274,7 @@ export const useSocialStore = create<SocialState>()(
           const { error: saveError } = await supabase
             .from('scheduled_posts')
             .insert({
+              user_id: userData.user.id,
               platform: post.platform,
               content: post.content,
               scheduled_for: post.scheduledFor,
