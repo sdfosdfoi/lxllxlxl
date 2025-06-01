@@ -1,6 +1,12 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { toast } from 'react-hot-toast';
+import { createClient } from '@supabase/supabase-js';
+
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL || '',
+  import.meta.env.VITE_SUPABASE_ANON_KEY || ''
+);
 
 export type SocialPlatform = 'telegram' | 'instagram' | 'tiktok';
 
@@ -38,7 +44,6 @@ export interface ScheduledPost {
   scheduledFor: string;
   status: 'pending' | 'published' | 'failed';
   error?: string;
-  timer?: NodeJS.Timeout;
 }
 
 interface SocialState {
@@ -50,7 +55,7 @@ interface SocialState {
   connectAccount: (platform: SocialPlatform, code: string, channelUsername?: string) => Promise<void>;
   disconnectAccount: (platform: SocialPlatform) => Promise<void>;
   getAccount: (platform: SocialPlatform) => SocialAccount | undefined;
-  schedulePost: (post: Omit<ScheduledPost, 'id' | 'status' | 'timer'>) => Promise<void>;
+  schedulePost: (post: Omit<ScheduledPost, 'id' | 'status'>) => Promise<void>;
   publishNow: (platform: SocialPlatform, content: { text: string; video?: File }) => Promise<void>;
   fetchStats: (platform: SocialPlatform) => Promise<void>;
 }
@@ -164,6 +169,20 @@ export const useSocialStore = create<SocialState>()(
             stats
           };
 
+          // Save account to Supabase
+          const { error: saveError } = await supabase
+            .from('social_accounts')
+            .upsert({
+              platform,
+              platform_user_id: platformUserId,
+              access_token: code,
+              metadata
+            });
+
+          if (saveError) {
+            throw saveError;
+          }
+
           set(state => ({
             accounts: [...existingAccounts, newAccount],
             loading: false
@@ -183,13 +202,25 @@ export const useSocialStore = create<SocialState>()(
             throw new Error('Invalid platform');
           }
 
-          // Clear any existing scheduled posts for this platform
-          const scheduledPosts = get().scheduledPosts;
-          scheduledPosts.forEach(post => {
-            if (post.platform === platform && post.timer) {
-              clearTimeout(post.timer);
-            }
-          });
+          // Delete account from Supabase
+          const { error: deleteError } = await supabase
+            .from('social_accounts')
+            .delete()
+            .eq('platform', platform);
+
+          if (deleteError) {
+            throw deleteError;
+          }
+
+          // Delete scheduled posts for this platform
+          const { error: deletePostsError } = await supabase
+            .from('scheduled_posts')
+            .delete()
+            .eq('platform', platform);
+
+          if (deletePostsError) {
+            throw deletePostsError;
+          }
 
           set(state => ({
             accounts: state.accounts.filter(acc => acc.platform !== platform),
@@ -219,48 +250,29 @@ export const useSocialStore = create<SocialState>()(
           }
 
           set({ loading: true });
-          
+
           const newPost: ScheduledPost = {
             ...post,
             id: Math.random().toString(36).substring(2),
             status: 'pending'
           };
 
-          // Calculate delay until scheduled time
-          const scheduledTime = new Date(post.scheduledFor).getTime();
-          const now = Date.now();
-          const delay = Math.max(0, scheduledTime - now);
+          // Save post to Supabase
+          const { error: saveError } = await supabase
+            .from('scheduled_posts')
+            .insert({
+              platform: post.platform,
+              content: post.content,
+              scheduled_for: post.scheduledFor,
+              status: 'pending'
+            });
 
-          // Create timer for post
-          const timer = setTimeout(async () => {
-            try {
-              await get().publishNow(post.platform, post.content);
-              
-              set(state => ({
-                scheduledPosts: state.scheduledPosts.map(p => 
-                  p.id === newPost.id 
-                    ? { ...p, status: 'published', timer: undefined }
-                    : p
-                )
-              }));
+          if (saveError) {
+            throw saveError;
+          }
 
-              toast.success(`Пост опубликован в ${post.platform}`);
-            } catch (error) {
-              set(state => ({
-                scheduledPosts: state.scheduledPosts.map(p => 
-                  p.id === newPost.id 
-                    ? { ...p, status: 'failed', error: error.message, timer: undefined }
-                    : p
-                )
-              }));
-
-              toast.error(`Ошибка публикации в ${post.platform}: ${error.message}`);
-            }
-          }, delay);
-
-          // Save post with timer
           set(state => ({
-            scheduledPosts: [...state.scheduledPosts, { ...newPost, timer }],
+            scheduledPosts: [...state.scheduledPosts, newPost],
             loading: false
           }));
 
