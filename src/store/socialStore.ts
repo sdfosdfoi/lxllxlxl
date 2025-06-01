@@ -38,17 +38,19 @@ export interface ScheduledPost {
   scheduledFor: string;
   status: 'pending' | 'published' | 'failed';
   error?: string;
+  timer?: NodeJS.Timeout;
 }
 
 interface SocialState {
   accounts: SocialAccount[];
+  scheduledPosts: ScheduledPost[];
   loading: boolean;
   error: string | null;
   
   connectAccount: (platform: SocialPlatform, code: string, channelUsername?: string) => Promise<void>;
   disconnectAccount: (platform: SocialPlatform) => Promise<void>;
   getAccount: (platform: SocialPlatform) => SocialAccount | undefined;
-  schedulePost: (post: Omit<ScheduledPost, 'id' | 'status'>) => Promise<void>;
+  schedulePost: (post: Omit<ScheduledPost, 'id' | 'status' | 'timer'>) => Promise<void>;
   publishNow: (platform: SocialPlatform, content: { text: string; video?: File }) => Promise<void>;
   fetchStats: (platform: SocialPlatform) => Promise<void>;
 }
@@ -63,6 +65,7 @@ export const useSocialStore = create<SocialState>()(
   persist(
     (set, get) => ({
       accounts: [],
+      scheduledPosts: [],
       loading: false,
       error: null,
 
@@ -119,13 +122,7 @@ export const useSocialStore = create<SocialState>()(
               break;
 
             case 'instagram':
-              try {
-                throw new Error('Нужен бизнес-аккаунт');
-              } catch (error) {
-                console.error('Instagram API error:', error);
-                throw error;
-              }
-              break;
+              throw new Error('Нужен бизнес-аккаунт');
 
             case 'tiktok':
               try {
@@ -186,8 +183,17 @@ export const useSocialStore = create<SocialState>()(
             throw new Error('Invalid platform');
           }
 
+          // Clear any existing scheduled posts for this platform
+          const scheduledPosts = get().scheduledPosts;
+          scheduledPosts.forEach(post => {
+            if (post.platform === platform && post.timer) {
+              clearTimeout(post.timer);
+            }
+          });
+
           set(state => ({
             accounts: state.accounts.filter(acc => acc.platform !== platform),
+            scheduledPosts: state.scheduledPosts.filter(post => post.platform !== platform),
             loading: false
           }));
 
@@ -220,9 +226,44 @@ export const useSocialStore = create<SocialState>()(
             status: 'pending'
           };
 
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          // Calculate delay until scheduled time
+          const scheduledTime = new Date(post.scheduledFor).getTime();
+          const now = Date.now();
+          const delay = Math.max(0, scheduledTime - now);
 
-          set({ loading: false });
+          // Create timer for post
+          const timer = setTimeout(async () => {
+            try {
+              await get().publishNow(post.platform, post.content);
+              
+              set(state => ({
+                scheduledPosts: state.scheduledPosts.map(p => 
+                  p.id === newPost.id 
+                    ? { ...p, status: 'published', timer: undefined }
+                    : p
+                )
+              }));
+
+              toast.success(`Пост опубликован в ${post.platform}`);
+            } catch (error) {
+              set(state => ({
+                scheduledPosts: state.scheduledPosts.map(p => 
+                  p.id === newPost.id 
+                    ? { ...p, status: 'failed', error: error.message, timer: undefined }
+                    : p
+                )
+              }));
+
+              toast.error(`Ошибка публикации в ${post.platform}: ${error.message}`);
+            }
+          }, delay);
+
+          // Save post with timer
+          set(state => ({
+            scheduledPosts: [...state.scheduledPosts, { ...newPost, timer }],
+            loading: false
+          }));
+
           toast.success('Пост успешно запланирован');
         } catch (error) {
           console.error('Error scheduling post:', error);
