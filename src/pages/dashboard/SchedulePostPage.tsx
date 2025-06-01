@@ -7,7 +7,6 @@ import { useSocialStore, type SocialPlatform } from '../../store/socialStore';
 interface FormData {
   text: string;
   platforms: SocialPlatform[];
-  scheduledDate?: Date;
 }
 
 const SchedulePostPage: React.FC = () => {
@@ -65,6 +64,21 @@ const SchedulePostPage: React.FC = () => {
     setVideoPreviewUrl(null);
   };
 
+  const handleDateChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const dateValue = event.target.value;
+    if (dateValue) {
+      const selectedDateTime = new Date(dateValue);
+      if (selectedDateTime > new Date()) {
+        setSelectedDate(selectedDateTime);
+      } else {
+        toast.error('Выберите дату в будущем');
+        setSelectedDate(null);
+      }
+    } else {
+      setSelectedDate(null);
+    }
+  };
+
   const handlePost = async (data: FormData) => {
     try {
       if (selectedPlatforms.length === 0) {
@@ -77,7 +91,11 @@ const SchedulePostPage: React.FC = () => {
         return;
       }
 
-      // Validate platforms before processing
+      if (isScheduling && !selectedDate) {
+        toast.error('Выберите дату и время публикации');
+        return;
+      }
+
       const validPlatforms = selectedPlatforms.filter((platform): platform is SocialPlatform => 
         ['telegram', 'instagram', 'tiktok'].includes(platform)
       );
@@ -98,8 +116,7 @@ const SchedulePostPage: React.FC = () => {
             userId: 'current-user',
             platform,
             content,
-            scheduledFor: selectedDate.toISOString(),
-            status: 'pending'
+            scheduledFor: selectedDate.toISOString()
           });
         }
         toast.success('Публикация видео запланирована!');
@@ -111,13 +128,14 @@ const SchedulePostPage: React.FC = () => {
       }
 
       handleRemoveVideo();
+      setSelectedDate(null);
+      setIsScheduling(false);
     } catch (error) {
       toast.error('Ошибка при публикации');
       console.error(error);
     }
   };
 
-  // Only show platforms that are connected
   const connectedPlatforms = accounts.map(account => {
     switch (account.platform) {
       case 'telegram':
@@ -284,7 +302,10 @@ const SchedulePostPage: React.FC = () => {
                   <input
                     type="radio"
                     checked={!isScheduling}
-                    onChange={() => setIsScheduling(false)}
+                    onChange={() => {
+                      setIsScheduling(false);
+                      setSelectedDate(null);
+                    }}
                     className="form-radio h-4 w-4 text-primary-600"
                   />
                   <span className="ml-2">Опубликовать сейчас</span>
@@ -310,7 +331,8 @@ const SchedulePostPage: React.FC = () => {
                         type="datetime-local"
                         className="input pl-10"
                         min={new Date().toISOString().slice(0, 16)}
-                        onChange={(e) => setSelectedDate(e.target.value ? new Date(e.target.value) : null)}
+                        onChange={handleDateChange}
+                        value={selectedDate ? selectedDate.toISOString().slice(0, 16) : ''}
                       />
                     </div>
                     {isScheduling && !selectedDate && (
